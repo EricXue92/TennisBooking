@@ -17,9 +17,13 @@ import logging
 import re
 from dataclasses import dataclass
 from datetime import date, datetime, time
+from typing import TYPE_CHECKING
 from urllib.parse import quote
 
 import httpx
+
+if TYPE_CHECKING:  # pragma: no cover
+    from src.config import Site
 
 _LOG = logging.getLogger("booker")
 
@@ -147,12 +151,6 @@ _DEFAULT_HEADERS = {
     "sec-ch-ua-platform": '"macOS"',
 }
 
-_REFERER_MAKE_BOOK = (
-    "https://www40.polyu.edu.hk/starspossfbns/secure/ui_make_book/make_book.do"
-)
-_REFERER_MAKE_BOOK_SUBMIT = (
-    "https://www40.polyu.edu.hk/starspossfbns/secure/ui_make_book/make_book_submit.do"
-)
 _ORIGIN = "https://www40.polyu.edu.hk"
 
 
@@ -185,6 +183,7 @@ class PolyUHttpClient:
         fb_user_id: str,
         timeout: float = 6.0,
         submit_timeout: float = 20.0,
+        site: "Site | None" = None,
     ) -> None:
         # Two budgets, because the two hot-path POSTs behave nothing alike.
         #
@@ -203,6 +202,10 @@ class PolyUHttpClient:
         # A long budget no longer starves the lower-priority fallback — the
         # orchestrator staggers groups instead of serializing them, see
         # src/http_booker.py:SUBMIT_STAGGER_SECONDS.
+        from src.config import STAFF_SITE
+        # Which deployment (staff vs student context root) every POST targets;
+        # Referer headers are derived from it so they always match the URL.
+        self.site = site if site is not None else STAFF_SITE
         self.csrf_token = csrf_token
         self.fb_user_id = fb_user_id
         # Connect stays on the short budget: at 08:30 the pool is already warm,
@@ -240,16 +243,15 @@ class PolyUHttpClient:
         or -1 on transport error. Never raises — a failed warmup must not
         prevent the real booking.
         """
-        from src.config import MAKE_BOOK_URL
         import asyncio
 
         async def _one() -> int:
             try:
                 resp = await self._http.get(
-                    MAKE_BOOK_URL,
+                    self.site.make_book_url,
                     headers={
                         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                        "Referer": _REFERER_MAKE_BOOK,
+                        "Referer": self.site.make_book_url,
                     },
                 )
                 return resp.status_code
@@ -268,7 +270,6 @@ class PolyUHttpClient:
         facility for each priority time.
         """
         from src.config import (
-            TIMETABLE_URL,
             TENNIS_ACTV_ID,
             TENNIS_CENTER_NAME,
             TENNIS_CTR_ID,
@@ -289,13 +290,13 @@ class PolyUHttpClient:
             "showCourtAreaDetails": "true",
         }
         resp = await self._http.post(
-            TIMETABLE_URL,
+            self.site.timetable_url,
             params={"CSRFToken": self.csrf_token},
             data=form,
             headers={
                 "Accept": "application/json, text/javascript, */*; q=0.01",
                 "X-Requested-With": "XMLHttpRequest",
-                "Referer": _REFERER_MAKE_BOOK,
+                "Referer": self.site.make_book_url,
             },
         )
         resp.raise_for_status()
@@ -344,7 +345,6 @@ class PolyUHttpClient:
         root-causeable from CI logs alone.
         """
         from src.config import (
-            MAKE_BOOK_URL,
             TENNIS_ACTV_ID,
             TENNIS_DATA_SET_ID,
         )
@@ -379,12 +379,12 @@ class PolyUHttpClient:
         t0 = _time.perf_counter()
         try:
             resp = await self._http.post(
-                MAKE_BOOK_URL,
+                self.site.make_book_url,
                 data=cell_form,
                 headers={
                     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                     "Origin": _ORIGIN,
-                    "Referer": _REFERER_MAKE_BOOK,
+                    "Referer": self.site.make_book_url,
                     "Upgrade-Insecure-Requests": "1",
                 },
             )
@@ -442,7 +442,6 @@ class PolyUHttpClient:
         narrow detector misclassified 2026-06-07's response as ERROR_FATAL.
         """
         from src.config import (
-            MAKE_BOOK_SUBMIT_URL,
             TENNIS_ACTV_ID,
             TENNIS_DATA_SET_ID,
         )
@@ -489,13 +488,13 @@ class PolyUHttpClient:
         multipart_files = {name: (None, value) for name, value in submit_fields.items()}
         try:
             resp = await self._http.post(
-                MAKE_BOOK_SUBMIT_URL,
+                self.site.make_book_submit_url,
                 files=multipart_files,
                 timeout=self._submit_timeout,
                 headers={
                     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                     "Origin": _ORIGIN,
-                    "Referer": _REFERER_MAKE_BOOK_SUBMIT,
+                    "Referer": self.site.make_book_submit_url,
                     "Upgrade-Insecure-Requests": "1",
                 },
             )

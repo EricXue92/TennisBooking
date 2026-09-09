@@ -14,6 +14,10 @@ on:
         # until 08:30 to hit slot-open. Override with -f skip_sleep=true for
         # ad-hoc manual runs past 08:30 (sleep_until_hkt is a no-op then).
         default: false
+      target_date:
+        description: "Override target date (YYYY-MM-DD) — manual verification only"
+        type: string
+        default: ""
 
 jobs:
   book:
@@ -27,6 +31,10 @@ jobs:
       TZ: Asia/Hong_Kong
       POLYU_USERNAME: ${{ secrets.POLYU_USERNAME }}
       POLYU_PASSWORD: ${{ secrets.POLYU_PASSWORD }}
+      # Student account (starspossfbstud). Only used on STUDENT_TARGET_DATES
+      # (src/config.py); the booker never reads these on other days.
+      POLYU_STUDENT_USERNAME: ${{ secrets.POLYU_STUDENT_USERNAME }}
+      POLYU_STUDENT_PASSWORD: ${{ secrets.POLYU_STUDENT_PASSWORD }}
 
     steps:
       - uses: actions/checkout@v4
@@ -47,6 +55,7 @@ jobs:
           ARGS=""
           if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then ARGS="$ARGS --dry-run"; fi
           if [ "${{ github.event.inputs.skip_sleep }}" = "true" ]; then ARGS="$ARGS --skip-sleep"; fi
+          if [ -n "${{ github.event.inputs.target_date }}" ]; then ARGS="$ARGS --target-date ${{ github.event.inputs.target_date }}"; fi
           uv run book-tennis $ARGS
 
       - name: Upload artifacts

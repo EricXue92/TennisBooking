@@ -5,21 +5,28 @@ import asyncio
 import logging
 import os
 import sys
-from datetime import date, datetime, timedelta
+from dataclasses import dataclass
+from datetime import date, datetime, time, timedelta
+from typing import TYPE_CHECKING, Any, Sequence
 
 from playwright.async_api import (
     Page,
 )
 
 from src.config import (
-    LOGIN_URL,
+    ACCOUNTS,
+    STAFF_SITE,
     SELECTORS,
     TRIGGER_TIME_HKT,
+    Account,
+    Site,
     require,
-    slot_priority_for,
 )
 from src.dates import compute_target_date, seconds_until_hkt_time
 from src.log import build_logger
+
+if TYPE_CHECKING:  # pragma: no cover
+    from src.http_client import PolyUHttpClient
 
 
 DEFAULT_TIMEOUT_MS = 20_000
@@ -38,9 +45,16 @@ class LoginFailed(RuntimeError):
     pass
 
 
-async def login(page: Page, username: str, password: str, log: logging.Logger) -> None:
-    log.info("loading login page")
-    await page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=DEFAULT_TIMEOUT_MS)
+async def login(
+    page: Page,
+    username: str,
+    password: str,
+    log: logging.Logger,
+    *,
+    site: Site = STAFF_SITE,
+) -> None:
+    log.info("loading login page (%s)", site.base_path)
+    await page.goto(site.login_url, wait_until="domcontentloaded", timeout=DEFAULT_TIMEOUT_MS)
     # POSS issues a meta-refresh redirect to loginhome.do; wait for the form.
     await page.wait_for_selector(
         require(SELECTORS.login_username, "login_username"),
@@ -59,12 +73,12 @@ async def login(page: Page, username: str, password: str, log: logging.Logger) -
     ).count() > 0:
         raise LoginFailed(
             f"still on login page after submit (url={page.url!r}); "
-            f"check POLYU_USERNAME / POLYU_PASSWORD secrets"
+            f"check the credentials for site {site.base_path!r}"
         )
     log.info("login complete (url=%s)", page.url)
 
 
-async def bootstrap_http_client(page, *, log: logging.Logger):
+async def bootstrap_http_client(page, *, log: logging.Logger, site: Site = STAFF_SITE):
     """Extract session state from a post-login make_book.do page into a PolyUHttpClient.
 
     Caller is responsible for calling `client.aclose()`. Raises HtmlParseError
@@ -113,30 +127,115 @@ async def bootstrap_http_client(page, *, log: logging.Logger):
         cookies=cookies,
         csrf_token=csrf_token,
         fb_user_id=fb_user_id,
+        site=site,
     )
 
 
+# --- Multi-account orchestration -------------------------------------------
 
-async def run(*, dry_run: bool = False, skip_sleep: bool = False) -> int:
-    """Returns 0 on successful booking, 1 on no-slot-available or any failure."""
-    from playwright.async_api import async_playwright
+SlotList = list[tuple[time, time]]
 
-    from src.config import MAKE_BOOK_URL
+
+def active_jobs(
+    target_date: date,
+    accounts: Sequence[Account] = ACCOUNTS,
+) -> list[tuple[Account, SlotList]]:
+    """Return (account, slots) for every account that books on target_date.
+
+    An account whose slot rule returns an empty tuple (rest day, or a
+    student date outside STUDENT_TARGET_DATES) is left out entirely.
+    """
+    jobs: list[tuple[Account, SlotList]] = []
+    for account in accounts:
+        slots = list(account.slot_priority(target_date))
+        if slots:
+            jobs.append((account, slots))
+    return jobs
+
+
+@dataclass
+class AccountJob:
+    """One account's fully-prepared booking run: a bootstrapped client plus
+    the slots it should try, and a logger that redacts *its* password."""
+    account: Account
+    slots: SlotList
+    client: Any  # PolyUHttpClient (or a test fake with cell_click/submit)
+    log: logging.Logger
+
+
+async def book_all(
+    jobs: Sequence[AccountJob],
+    target_date: date,
+    dry_run: bool,
+    *,
+    log: logging.Logger,
+) -> int:
+    """Fire every account's book_via_http concurrently.
+
+    Accounts are independent: one failing (or raising) never aborts the
+    others. Returns 0 only if every account booked; 1 otherwise, so the
+    owner is emailed whenever any expected court is missing.
+    """
     from src.http_booker import book_via_http
 
-    username = os.environ["POLYU_USERNAME"]
-    password = os.environ["POLYU_PASSWORD"]
-    log = build_logger("booker", secret=password)
+    async def _one(job: AccountJob) -> int:
+        try:
+            return await book_via_http(
+                job.client, target_date, job.slots, dry_run, log=job.log,
+            )
+        except Exception:  # noqa: BLE001 - isolate accounts from each other
+            job.log.exception("account %s crashed", job.account.name)
+            return 1
 
-    target_date = compute_target_date()
+    results = await asyncio.gather(*(_one(j) for j in jobs))
+    for job, rc in zip(jobs, results):
+        log.info("account %s: %s", job.account.name, "BOOKED" if rc == 0 else "FAILED")
+    return 0 if all(rc == 0 for rc in results) else 1
+
+
+
+def resolve_target_date(override: str | None) -> date:
+    """Target date: `override` (ISO YYYY-MM-DD) if given, else 7 days ahead.
+
+    The override exists for manual/dry-run verification of date-specific
+    rules (e.g. the student account's dates); the CF Worker never passes it.
+    """
+    if override:
+        return date.fromisoformat(override)
+    return compute_target_date()
+
+
+async def run(
+    *,
+    dry_run: bool = False,
+    skip_sleep: bool = False,
+    target_date_override: str | None = None,
+) -> int:
+    """Returns 0 when every active account booked, 1 on no-slot or any failure."""
+    from playwright.async_api import async_playwright
+
+    from src.config import TENNIS_FACILITIES
+
+    log = build_logger("booker", secret="")
+
+    target_date = resolve_target_date(target_date_override)
     log.info("target booking date: %s", target_date)
 
-    slots = list(slot_priority_for(target_date))
-    if not slots:
+    jobs = active_jobs(target_date)
+    if not jobs:
         # Rest weekday (e.g. Tuesday): nothing to book. Exit 0 so the
         # watchdog treats the day as accounted for and doesn't open an issue.
         log.info("no slots configured for %s (rest day); skipping run", target_date)
         return 0
+
+    # Resolve credentials up front so a missing secret fails now, not at 08:29.
+    creds: list[tuple[Account, SlotList, str, str, logging.Logger]] = []
+    for account, slots in jobs:
+        username = os.environ[account.username_env]
+        password = os.environ[account.password_env]
+        acct_log = build_logger("booker", secret=password, session_id=account.name)
+        creds.append((account, slots, username, password, acct_log))
+        log.info("account %s (%s): %d slots", account.name, account.site.base_path, len(slots))
 
     prelogin_target = (
         datetime.combine(date.today(), TRIGGER_TIME_HKT)
@@ -149,28 +248,37 @@ async def run(*, dry_run: bool = False, skip_sleep: bool = False) -> int:
         await asyncio.sleep(delay)
         log.info("woke up for pre-login phase")
 
-    client = None
+    prepared: list[AccountJob] = []
     try:
-        # Phase 1: Playwright login → extract session state → close browser.
+        # Phase 1: Playwright login per account (fresh context each, so the
+        # two sites' path-scoped cookies never mix) -> extract session state
+        # -> close browser.
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
             try:
-                context = await browser.new_context()
-                page = await context.new_page()
-                page.set_default_timeout(20_000)
-                await login(page, username, password, log)
-                # Defensive: make sure we're on make_book.do (login normally
-                # redirects there but PolyU could theoretically land us on a
-                # password-expired page or a different post-login screen).
-                if "make_book.do" not in page.url:
-                    log.info("post-login url=%s; navigating to make_book.do", page.url)
-                    await page.goto(MAKE_BOOK_URL, wait_until="domcontentloaded", timeout=DEFAULT_TIMEOUT_MS)
-                client = await bootstrap_http_client(page, log=log)
+                for account, slots, username, password, acct_log in creds:
+                    context = await browser.new_context()
+                    page = await context.new_page()
+                    page.set_default_timeout(20_000)
+                    await login(page, username, password, acct_log, site=account.site)
+                    # Defensive: make sure we're on make_book.do (login normally
+                    # redirects there but PolyU could theoretically land us on a
+                    # password-expired page or a different post-login screen).
+                    if "make_book.do" not in page.url:
+                        acct_log.info("post-login url=%s; navigating to make_book.do", page.url)
+                        await page.goto(
+                            account.site.make_book_url,
+                            wait_until="domcontentloaded",
+                            timeout=DEFAULT_TIMEOUT_MS,
+                        )
+                    client = await bootstrap_http_client(page, log=acct_log, site=account.site)
+                    prepared.append(AccountJob(account, slots, client, acct_log))
+                    await context.close()
             finally:
                 await browser.close()
 
-        # Phase 2: warm up the HTTP connection ~2s before trigger, then sleep
-        # the last sliver and fire the booking flow.
+        # Phase 2: warm up every account's connection pool ~2s before trigger,
+        # then sleep the last sliver and fire all accounts together.
         if not skip_sleep:
             warmup_target = (
                 datetime.combine(date.today(), TRIGGER_TIME_HKT)
@@ -179,20 +287,23 @@ async def run(*, dry_run: bool = False, skip_sleep: bool = False) -> int:
             delay = seconds_until_hkt_time(warmup_target)
             log.info("sleeping %.3fs until HKT %s (pre-warmup)", delay, warmup_target)
             await asyncio.sleep(delay)
-            from src.config import TENNIS_FACILITIES
-            n_candidates = len(slots) * len(TENNIS_FACILITIES)
-            log.info("warming up %d HTTP connections", n_candidates)
-            statuses = await client.warmup(n=n_candidates)
-            log.info("warmup complete (statuses=%s)", statuses)
+
+            async def _warm(job: AccountJob) -> None:
+                n = len(job.slots) * len(TENNIS_FACILITIES)
+                job.log.info("warming up %d HTTP connections", n)
+                statuses = await job.client.warmup(n=n)
+                job.log.info("warmup complete (statuses=%s)", statuses)
+
+            await asyncio.gather(*(_warm(j) for j in prepared))
 
             delay = seconds_until_hkt_time(TRIGGER_TIME_HKT)
             log.info("sleeping %.3fs until HKT %s (trigger)", delay, TRIGGER_TIME_HKT)
             await asyncio.sleep(delay)
-            log.info("woke up at trigger time, firing predictive booking")
-        return await book_via_http(client, target_date, slots, dry_run, log=log)
+            log.info("woke up at trigger time, firing predictive booking for %d account(s)", len(prepared))
+        return await book_all(prepared, target_date, dry_run, log=log)
     finally:
-        if client is not None:
-            await client.aclose()
+        for job in prepared:
+            await job.client.aclose()
 
 
 def main() -> None:
@@ -206,8 +317,16 @@ def main() -> None:
         "--skip-sleep", action="store_true",
         help="don't wait until HKT 08:30; run immediately",
     )
+    parser.add_argument(
+        "--target-date", default=None, metavar="YYYY-MM-DD",
+        help="override the 7-days-ahead target date (manual verification only)",
+    )
     args = parser.parse_args()
-    sys.exit(asyncio.run(run(dry_run=args.dry_run, skip_sleep=args.skip_sleep)))
+    sys.exit(asyncio.run(run(
+        dry_run=args.dry_run,
+        skip_sleep=args.skip_sleep,
+        target_date_override=args.target_date,
+    )))
 
 
 if __name__ == "__main__":

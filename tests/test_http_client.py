@@ -890,3 +890,55 @@ async def test_cell_click_keeps_the_short_default_timeout():
     finally:
         await client.aclose()
     assert captured["timeout"]["read"] == 6.0
+
+
+# --- Site-aware client (student site) ---
+
+_STUD = "https://www40.polyu.edu.hk/starspossfbstud/secure/ui_make_book/"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_client_on_student_site_posts_to_student_urls():
+    from src.config import STUDENT_SITE
+    from src.http_client import BookingResult, CellOutcome, PolyUHttpClient
+
+    cell = respx.post(_STUD + "make_book.do").mock(return_value=Response(
+        302, headers={"location": _STUD + "make_book_submit.do"}))
+    sub = respx.post(_STUD + "make_book_submit.do").mock(return_value=Response(
+        302, headers={"location": _STUD + "make_book_result.do"}))
+    warm = respx.get(_STUD + "make_book.do").mock(return_value=Response(200, text="ok"))
+
+    client = PolyUHttpClient(
+        cookies={"JSESSIONID": "x"}, csrf_token="t", fb_user_id="1", site=STUDENT_SITE,
+    )
+    try:
+        assert await client.warmup(n=1) == [200]
+        cr = await client.cell_click(_slot_11_at_1230())
+        result = await client.submit(_slot_11_at_1230())
+    finally:
+        await client.aclose()
+
+    assert cr.outcome is CellOutcome.ACCEPTED
+    assert result is BookingResult.SUCCESS
+    assert warm.called and cell.called and sub.called
+    # Referer / Origin must match the site actually being posted to.
+    assert cell.calls.last.request.headers["referer"] == _STUD + "make_book.do"
+    assert sub.calls.last.request.headers["referer"] == _STUD + "make_book_submit.do"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_client_defaults_to_staff_site():
+    from src.http_client import CellOutcome, PolyUHttpClient
+
+    staff = "https://www40.polyu.edu.hk/starspossfbns/secure/ui_make_book/"
+    cell = respx.post(staff + "make_book.do").mock(return_value=Response(
+        302, headers={"location": staff + "make_book_submit.do"}))
+    client = PolyUHttpClient(cookies={"JSESSIONID": "x"}, csrf_token="t", fb_user_id="1")
+    try:
+        cr = await client.cell_click(_slot_11_at_1230())
+    finally:
+        await client.aclose()
+    assert cr.outcome is CellOutcome.ACCEPTED
+    assert cell.calls.last.request.headers["referer"] == staff + "make_book.do"
