@@ -249,33 +249,54 @@ async def run(
         log.info("woke up for pre-login phase")
 
     prepared: list[AccountJob] = []
+    login_failed = False
     try:
         # Phase 1: Playwright login per account (fresh context each, so the
         # two sites' path-scoped cookies never mix) -> extract session state
-        # -> close browser.
+        # -> close browser. Accounts log in concurrently: one login is ~10s
+        # in CI, and serialising them would eat the 60s pre-login lead.
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
             try:
-                for account, slots, username, password, acct_log in creds:
+                async def _prepare(account, slots, username, password, acct_log) -> AccountJob:
                     context = await browser.new_context()
-                    page = await context.new_page()
-                    page.set_default_timeout(20_000)
-                    await login(page, username, password, acct_log, site=account.site)
-                    # Defensive: make sure we're on make_book.do (login normally
-                    # redirects there but PolyU could theoretically land us on a
-                    # password-expired page or a different post-login screen).
-                    if "make_book.do" not in page.url:
-                        acct_log.info("post-login url=%s; navigating to make_book.do", page.url)
-                        await page.goto(
-                            account.site.make_book_url,
-                            wait_until="domcontentloaded",
-                            timeout=DEFAULT_TIMEOUT_MS,
-                        )
-                    client = await bootstrap_http_client(page, log=acct_log, site=account.site)
-                    prepared.append(AccountJob(account, slots, client, acct_log))
-                    await context.close()
+                    try:
+                        page = await context.new_page()
+                        page.set_default_timeout(20_000)
+                        await login(page, username, password, acct_log, site=account.site)
+                        # Defensive: make sure we're on make_book.do (login
+                        # normally redirects there but PolyU could land us on
+                        # a password-expired page or another post-login screen).
+                        if "make_book.do" not in page.url:
+                            acct_log.info("post-login url=%s; navigating to make_book.do", page.url)
+                            await page.goto(
+                                account.site.make_book_url,
+                                wait_until="domcontentloaded",
+                                timeout=DEFAULT_TIMEOUT_MS,
+                            )
+                        client = await bootstrap_http_client(page, log=acct_log, site=account.site)
+                    finally:
+                        await context.close()
+                    return AccountJob(account, slots, client, acct_log)
+
+                outcomes = await asyncio.gather(
+                    *(_prepare(*c) for c in creds), return_exceptions=True,
+                )
             finally:
                 await browser.close()
+
+        # A failed login for one account must not cost the other its court:
+        # log it, carry on with whoever got in, and still exit 1 at the end.
+        for (account, _slots, _u, _p, acct_log), outcome in zip(creds, outcomes):
+            if isinstance(outcome, BaseException):
+                # Log via the account's own logger: Playwright errors can
+                # quote field values, and only acct_log redacts this password.
+                acct_log.error("login/bootstrap failed: %r", outcome)
+                login_failed = True
+            else:
+                prepared.append(outcome)
+        if not prepared:
+            raise RuntimeError("every account failed to log in")
 
         # Phase 2: warm up every account's connection pool ~2s before trigger,
         # then sleep the last sliver and fire all accounts together.
@@ -300,7 +321,8 @@ async def run(
             log.info("sleeping %.3fs until HKT %s (trigger)", delay, TRIGGER_TIME_HKT)
             await asyncio.sleep(delay)
             log.info("woke up at trigger time, firing predictive booking for %d account(s)", len(prepared))
-        return await book_all(prepared, target_date, dry_run, log=log)
+        rc = await book_all(prepared, target_date, dry_run, log=log)
+        return 1 if login_failed else rc
     finally:
         for job in prepared:
             await job.client.aclose()

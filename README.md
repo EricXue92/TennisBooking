@@ -59,6 +59,9 @@ POLYU_USERNAME='...' POLYU_PASSWORD='...' \
    ```bash
    gh secret set POLYU_USERNAME --body 'your-username'
    gh secret set POLYU_PASSWORD --body 'your-password'
+   # Optional second (student-site) account, only used on STUDENT_TARGET_DATES:
+   gh secret set POLYU_STUDENT_USERNAME --body 'student-username'
+   gh secret set POLYU_STUDENT_PASSWORD --body 'student-password'
    ```
 
 3. **Deploy the Cloudflare Worker** (the daily trigger). Full runbook in

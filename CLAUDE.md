@@ -16,6 +16,7 @@ uv run playwright install chromium        # one-time browser install
 uv run pytest                             # run all unit tests (offline, no network/browser)
 uv run pytest tests/test_http_booker.py::test_happy_path_rank0_wins
 uv run book-tennis --dry-run --skip-sleep # local end-to-end (needs POLYU_USERNAME/POLYU_PASSWORD)
+uv run book-tennis --dry-run --skip-sleep --target-date 2026-09-18  # exercise a date-specific rule
 ```
 
 Manual workflow trigger (use after watchdog issue, or to test on a branch):
@@ -23,6 +24,7 @@ Manual workflow trigger (use after watchdog issue, or to test on a branch):
 ```bash
 gh workflow run "Daily Tennis Booking" -f dry_run=false -f skip_sleep=true
 gh workflow run "Daily Tennis Booking" --ref <branch> -f ...   # CF Worker only triggers main; use --ref for branch tests
+gh workflow run "Daily Tennis Booking" -f dry_run=true -f skip_sleep=true -f target_date=2026-09-18  # verify a specific target date
 gh run watch <id> --interval 15 --exit-status                  # block until done
 ```
 
@@ -32,10 +34,13 @@ waiting until 08:30 HKT.
 
 ## Architecture
 
-The booking flow spans three files. `src/booker.py:run` does Playwright login
-at 08:29, extracts session state (cookies + CSRFToken + fbUserId) via
-`bootstrap_http_client`, closes the browser, sleeps to 08:30:00.000, and hands
-off to `src/http_booker.py:book_via_http`. That orchestrator **skips search**
+The booking flow spans three files. `src/booker.py:run` picks the active
+accounts for the target date (`active_jobs`), does a Playwright login for
+each at 08:29 (concurrently, one browser context per account), extracts
+session state (cookies + CSRFToken + fbUserId) via `bootstrap_http_client`,
+closes the browser, sleeps to 08:30:00.000, and hands off to
+`src/http_booker.py:book_via_http` once per account via `book_all`
+(`asyncio.gather`; exit 0 only if every account booked). That orchestrator **skips search**
 and runs two phases over the `(SLOT_PRIORITY × TENNIS_FACILITIES)` candidate
 set: phase 1 fires every candidate's `cell_click()` concurrently via
 `asyncio.gather`; phase 2 groups ACCEPTED cells by `(start, end)` time-slot
@@ -50,6 +55,30 @@ exists for diagnostic use but isn't called in production.)
 Incident history and full design rationale live in `docs/superpowers/specs/`
 and `docs/superpowers/plans/` — read the most recent files there before
 substantive changes.
+
+## Accounts and sites
+
+`src/config.py` defines `Site` (staff `starspossfbns`, student
+`starspossfbstud` — same host, different J2EE context root, all endpoint
+suffixes identical) and `Account` (site + credential env-var names + a
+`slot_priority(target_date)` rule). `ACCOUNTS = (STAFF_ACCOUNT,
+STUDENT_ACCOUNT)`. An account whose rule returns `()` sits the run out. Each
+`PolyUHttpClient` is bound to one `Site` and derives its URLs and Referer
+headers from it — never hardcode a context root in the client.
+
+- **Staff account** (`POLYU_USERNAME`/`POLYU_PASSWORD`): the daily booker,
+  rule `slot_priority_for` (see weekday adjustments below).
+- **Student account** (`POLYU_STUDENT_USERNAME`/`POLYU_STUDENT_PASSWORD`):
+  one-off, books ONLY when the target date is in `STUDENT_TARGET_DATES`
+  (currently 2026-09-18, 19, 20), trying 18:30 → 19:30 → 20:30 → 21:30 on
+  both courts. Both accounts fire at 08:30 together and compete with each
+  other for the same two courts; PolyU's first-come-first-served decides.
+  After the dates pass, empty the set (or remove the account) — nothing
+  else needs to change.
+- **Per-account isolation.** A failed login or a crash in one account is
+  logged and the other account still books; the run exits 1 afterwards so
+  the owner is emailed. Each account logs through its own
+  `build_logger(..., session_id=name)` so its password is redacted.
 
 ## Invariants (do not break these)
 
@@ -131,8 +160,9 @@ submit_timeout=20.0)`). `timeout` guards cell_click/warmup — those run
   URL still contains `loginhome` or the username field is still present and
   raises `LoginFailed` — wrong credentials must not masquerade as a
   downstream selector timeout.
-- **Exit codes drive notification.** Exit 0 = booked (silent). Exit 1 = no
-  slot or any error — GitHub emails the workflow owner on failure. There is
+- **Exit codes drive notification.** Exit 0 = every active account booked
+  (silent). Exit 1 = any account got no slot or errored — GitHub emails the
+  workflow owner on failure. There is
   deliberately no success-notification path.
 - **Tests are offline.** Everything in `tests/` uses fakes (e.g.
   `_FakeClient`) — no network, no Playwright. Don't add live integration
